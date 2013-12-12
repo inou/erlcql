@@ -33,7 +33,10 @@
 -include("erlcql.hrl").
 
 -export_types([reponse/0,
-               consistency/0]).
+               compression/0,
+               consistency/0,
+               event_type/0,
+               event_fun/0]).
 
 %%-----------------------------------------------------------------------------
 %% API functions
@@ -80,4 +83,6 @@ default(tracing) -> false;
 default(username) -> <<"cassandra">>;
 default(password) -> <<"cassandra">>;
 default(consistency) -> any;
-default(cql_version) -> <<"3.1.1">>.
+default(cql_version) -> <<"3.1.1">>;
+default(register) -> [];
+default(event_handler) -> self().

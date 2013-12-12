@@ -46,12 +46,14 @@
 -include("erlcql.hrl").
 
 -record(state, {
+          parent :: pid(),
           socket :: port(),
           async_ets :: integer(),
           credentials :: {bitstring(), bitstring()},
           flags :: {atom(), boolean()},
           streams = lists:seq(1, 127) :: [integer()],
-          parser :: parser()
+          parser :: parser(),
+          event_fun :: event_fun()
          }).
 
 -define(TCP_OPTS, [binary, {active, once}]).
@@ -65,10 +67,48 @@
 %% API
 %%-----------------------------------------------------------------------------
 
--spec start_link(proplists:proplist()) ->
-          {ok, pid()} | ignore | {error, Reason :: term()}.
+-spec start_link(proplists:proplist()) -> {ok, pid()} |
+                                          {error, Reason :: term()}.
 start_link(Opts) ->
-    gen_fsm:start_link(?MODULE, proplists:unfold(Opts), []).
+    Events = get_opt(register, Opts),
+    EventFun = event_fun(get_opt(event_handler, Opts)),
+    Opts2 = [{event_fun, EventFun} | Opts],
+    Opts3 = [{parent, self()} | Opts2],
+    case gen_fsm:start_link(?MODULE, proplists:unfold(Opts3), []) of
+        {ok, Pid} ->
+            WaitForRegister = fun(C) -> ?MODULE:register(C, Events) end,
+            wait_for([{true, fun wait_for_ready/1},
+                      {Events /= [], WaitForRegister}], Pid);
+        {error, _} = Error ->
+            Error
+    end.
+
+-spec wait_for_ready(pid()) -> {ok, pid()} | {error, timeout}.
+wait_for_ready(Pid) ->
+    receive
+        ready ->
+            {ok, Pid}
+    after
+        ?TIMEOUT ->
+            {error, timeout}
+    end.
+
+-spec wait_for([{boolean(), fun((pid()) -> {ok | error, term()})}], pid()) ->
+          {ok, pid()} | {error, term()}.
+wait_for([], Pid) ->
+    {ok, Pid};
+wait_for([{Cond, Fun} | Rest], Pid) ->
+    case Cond of
+        true ->
+            case Fun(Pid) of
+                {ok, _} ->
+                    wait_for(Rest, Pid);
+                {error, _} = Error ->
+                    Error
+            end;
+        false ->
+            wait_for(Rest, Pid)
+    end.
 
 -spec query(pid(), bitstring(), consistency()) ->
           result() | {error, Reason :: term()}.
@@ -88,7 +128,7 @@ execute(Pid, QueryId, Values, Consistency) ->
 options(Pid) ->
     async_call(Pid, options).
 
--spec register(pid(), [event_type()]) -> ready | {error, Reason :: term()}.
+-spec register(pid(), [event_type()]) -> {ok, ready} | {error, Reason :: term()}.
 register(Pid, Events) ->
     async_call(Pid, {register, Events}).
 
@@ -110,16 +150,20 @@ init(Opts) ->
             Password = get_opt(password, Opts),
             Credentials = {Username, Password},
             Parser = erlcql_decode:new_parser(),
+            {event_fun, EventFun} = lists:keyfind(event_fun, 1, Opts),
+            {parent, Parent} = lists:keyfind(parent, 1, Opts),
 
             Startup = erlcql_encode:startup(Compression, CQLVersion),
             Frame = erlcql_encode:frame(Startup, {false, Tracing}, 0),
             ok = gen_tcp:send(Socket, Frame),
 
-            {ok, startup, #state{socket = Socket,
+            {ok, startup, #state{parent = Parent,
+                                 socket = Socket,
                                  flags = Flags,
                                  credentials = Credentials,
                                  async_ets = AsyncETS,
-                                 parser = Parser}};
+                                 parser = Parser,
+                                 event_fun = EventFun}};
         {error, Reason} ->
             ?ERROR("Cannot connect to Cassandra: ~s", [Reason]),
             {stop, Reason}
@@ -130,6 +174,9 @@ handle_event({timeout, Stream}, StateName,
                     streams = Streams} = State) ->
     true = ets:delete(AsyncETS, Stream),
     {next_state, StateName, State#state{streams = [Stream | Streams]}};
+handle_event(ready, ready, #state{parent = Parent} = State) ->
+    Parent ! ready,
+    {next_state, ready, State};
 handle_event(Event, _StateName, State) ->
     {stop, {bad_event, Event}, State}.
 
@@ -204,21 +251,32 @@ terminate(_Reason, _StateName, _State) ->
 %% Internal functions
 %%-----------------------------------------------------------------------------
 
+-spec event_fun(event_fun() | pid()) -> event_fun().
+event_fun(Fun) when is_function(Fun) ->
+    Fun;
+event_fun(Pid) when is_pid(Pid) ->
+    fun(Event) -> Pid ! Event end.
+
 -spec async_call(pid(), tuple() | atom()) -> response() |
                                              {error, Reason :: term()}.
 async_call(Pid, Request) ->
     Ref = make_ref(),
     case gen_fsm:sync_send_event(Pid, {Ref, Request}) of
         {ok, Stream} ->
-            receive
-                {Ref, Response} ->
-                    Response
-            after ?TIMEOUT ->
-                    gen_fsm:send_all_state_event(Pid, {timeout, Stream}),
-                    {error, timeout}
-            end;
+            wait_for_response(Ref, Pid, Stream);
         {error, Reason} ->
             {error, Reason}
+    end.
+
+-spec wait_for_response(reference(), pid(), integer()) -> response() |
+                                                          {error, timeout}.
+wait_for_response(Ref, Pid, Stream) ->
+    receive
+        {Ref, Response} ->
+            Response
+    after ?TIMEOUT ->
+            gen_fsm:send_all_state_event(Pid, {timeout, Stream}),
+            {error, timeout}
     end.
 
 -spec send(request(), reference(), pid(), #state{}) ->
@@ -238,7 +296,8 @@ parse_ready(Data, #state{parser = Parser,
     case erlcql_decode:parse(Data, Parser, Compression) of
         {ok, [], NewParser} ->
             {next_state, startup, State#state{parser = NewParser}};
-        {ok, [{0, ready}], NewParser} ->
+        {ok, [{0, {ok, ready}}], NewParser} ->
+            send_ready(),
             {next_state, ready, State#state{parser = NewParser,
                                             streams = [0 | Streams]}};
         {ok, [{0, {authenticate, AuthClass}}], NewParser} ->
@@ -249,6 +308,10 @@ parse_ready(Data, #state{parser = Parser,
         {error, Reason} ->
             {stop, Reason, State}
     end.
+
+-spec send_ready() -> any().
+send_ready() ->
+    gen_fsm:send_all_state_event(self(), ready).
 
 try_auth(<<"org.apache.cassandra.auth.PasswordAuthenticator">>,
          #state{socket = Socket,
@@ -277,8 +340,10 @@ parse_response(Data, #state{parser = Parser,
 handle_responses(Responses, State) ->
     lists:foldl(fun handle_response/2, State, Responses).
 
-handle_response({-1, {event, _} = Event}, State) ->
+handle_response({-1, {event, Event}},
+                #state{event_fun = EventFun} = State) ->
     ?INFO("Received an event from Cassandra: ~p", [Event]),
+    EventFun(Event),
     State;
 handle_response({Stream, Response}, #state{async_ets = AsyncETS,
                                            streams = Streams} = State) ->

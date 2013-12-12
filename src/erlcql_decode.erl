@@ -216,7 +216,7 @@ consistency(7) -> each_quorum.
 
 -spec ready(binary()) -> ready.
 ready(<<>>) ->
-    ready.
+    {ok, ready}.
 
 %% Authenticate ---------------------------------------------------------------
 
@@ -457,7 +457,7 @@ schema_change(<<Length:?SHORT, Type:Length/binary,
 
 %% Event ----------------------------------------------------------------------
 
--spec event(binary()) -> event().
+-spec event(binary()) -> event_res().
 event(<<Length:?SHORT, Type:?STRING(Length), Data/binary>>) ->
     Event = case event_type(Type) of
                 topology_change ->
